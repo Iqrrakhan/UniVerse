@@ -1,19 +1,39 @@
 const express = require('express');
 const router = express.Router();
-const User = require('../models/user');
-const Product = require('../models/Product');
-const Review = require('../models/Review');
+const prisma = require('../lib/prisma');
 
 // @route GET /api/store/:sellerId
 router.get('/:sellerId', async (req, res) => {
   try {
-    const seller = await User.findById(req.params.sellerId).select('-password');
+    const sellerId = Number(req.params.sellerId);
+    const seller = await prisma.user.findUnique({
+      where: { id: sellerId },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        department: true,
+        role: true,
+        storeName: true,
+        createdAt: true
+      }
+    });
     if (!seller) return res.status(404).json({ message: 'Store not found' });
 
-    const products = await Product.find({ seller: req.params.sellerId });
-    const reviews = await Review.find({ seller: req.params.sellerId })
-      .populate('reviewer', 'name department')
-      .populate('product', 'title');
+    const [products, reviews] = await Promise.all([
+      prisma.product.findMany({
+        where: { sellerId },
+        orderBy: { createdAt: 'desc' }
+      }),
+      prisma.review.findMany({
+        where: { sellerId },
+        include: {
+          reviewer: { select: { id: true, name: true, department: true } },
+          product: { select: { id: true, title: true } }
+        },
+        orderBy: { createdAt: 'desc' }
+      })
+    ]);
 
     const avgRating = reviews.length
       ? (reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length).toFixed(1)

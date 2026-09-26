@@ -1,0 +1,518 @@
+// ============================================================
+// UniVerse v2 — Data Model
+// ============================================================
+// Key design decisions:
+//   - CUIDs for all IDs (no auto-incrementing integers)
+//   - Storefront is a separate entity from User
+//   - Category is a DB table, not a hardcoded enum
+//   - Order is per-storefront (cart splits at checkout)
+//   - Payment has immutable LedgerEntry audit trail
+//   - All timestamps use DateTime @default(now())
+// ============================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ─── IDENTITY & AUTH ─────────────────────────────────────────
+
+enum UserRole {
+  BUYER
+  VENDOR
+  ADMIN
+  MODERATOR
+}
+
+enum VerificationTier {
+  EMAIL_PENDING
+  EMAIL_VERIFIED
+  COMMUNITY_VERIFIED
+  BUSINESS_VERIFIED
+}
+
+model User {
+  id               String           @id @default(cuid())
+  email            String           @unique
+  passwordHash     String
+  name             String
+  phone            String?
+  avatarUrl        String?
+  role             UserRole         @default(BUYER)
+  emailVerified    Boolean          @default(false)
+  verificationTier VerificationTier @default(EMAIL_PENDING)
+  refreshToken     String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  storefront         Storefront?
+  orders             Order[]              @relation("BuyerOrders")
+  reviews            Review[]             @relation("ReviewAuthor")
+  follows            Follow[]
+  sentMessages       Message[]            @relation("Sender")
+  receivedMessages   Message[]            @relation("Receiver")
+  notifications      Notification[]
+  staffMemberships   StaffMember[]
+  verificationDocs   VerificationDocument[]
+  reports            Report[]             @relation("Reporter")
+
+  @@index([email])
+  @@index([role])
+}
+
+model VerificationDocument {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documentType String    // NTN, STRN, CNIC, BUSINESS_REG
+  fileUrl      String
+  status       DocStatus @default(PENDING)
+  reviewedBy   String?
+  reviewedAt   DateTime?
+  notes        String?
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum DocStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// ─── STOREFRONT & CATALOG ────────────────────────────────────
+
+model Storefront {
+  id             String      @id @default(cuid())
+  ownerId        String      @unique
+  owner          User        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  handle         String      @unique // @bakerytale
+  displayName    String
+  tagline        String?
+  description    String?
+  aboutContent   String?     // Rich about us text
+  teamMembers    Json?       // [{ name, role, avatarUrl, bio }]
+  categoryId     String
+  category       Category    @relation(fields: [categoryId], references: [id])
+  logoUrl        String?
+  bannerUrl      String?
+  themeColor     String      @default("#06b6d4")
+  accentColor    String      @default("#a855f7")
+  layoutVariant  String      @default("default")
+  status         StoreStatus @default(ACTIVE)
+  socialLinks    Json?       // { instagram, facebook, whatsapp, linkedin }
+  operatingHours Json?       // { mon: "9-5", tue: "9-5", ... }
+  vacationMode   Boolean     @default(false)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  products  Product[]
+  posts     Post[]
+  followers Follow[]
+  reviews   Review[]
+  orders    Order[]       @relation("SellerOrders")
+  staff     StaffMember[]
+
+  @@index([handle])
+  @@index([categoryId])
+  @@index([status])
+}
+
+enum StoreStatus {
+  ACTIVE
+  SUSPENDED
+  VACATION
+  CLOSED
+}
+
+model Category {
+  id              String @id @default(cuid())
+  name            String @unique // "Fashion & Accessories"
+  slug            String @unique // "fashion-accessories"
+  storefrontLabel String          // "Store", "Studio", "Kitchen"
+  icon            String?
+  description     String?
+  sortOrder       Int    @default(0)
+  isActive        Boolean @default(true)
+
+  storefronts Storefront[]
+  products    Product[]
+
+  @@index([slug])
+}
+
+model Product {
+  id           String   @id @default(cuid())
+  storefrontId String
+  storefront   Storefront @relation(fields: [storefrontId], references: [id], onDelete: Cascade)
+  categoryId   String
+  category     Category   @relation(fields: [categoryId], references: [id])
+  title        String
+  slug         String
+  description  String
+  basePrice    Decimal  @db.Decimal(10, 2)
+  itemType     ItemType
+  tags         String[] @default([])
+  inStock      Boolean  @default(true)
+  stockCount   Int?
+  isPinned     Boolean  @default(false)
+  isActive     Boolean  @default(true)
+  metadata     Json?    // category-specific fields
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  images     ProductImage[]
+  variants   ProductVariant[]
+  orderItems OrderItem[]
+  reviews    Review[]
+
+  @@unique([storefrontId, slug])
+  @@index([storefrontId])
+  @@index([categoryId])
+  @@index([isActive, inStock])
+}
+
+enum ItemType {
+  PHYSICAL
+  SERVICE
+  DIGITAL
+}
+
+model ProductImage {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  url       String
+  altText   String?
+  sortOrder Int     @default(0)
+
+  @@index([productId])
+}
+
+model ProductVariant {
+  id         String  @id @default(cuid())
+  productId  String
+  product    Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name       String  // "Large", "Red", "2-hour session"
+  price      Decimal? @db.Decimal(10, 2)
+  stockCount Int?
+  isActive   Boolean @default(true)
+
+  @@index([productId])
+}
+
+// ─── ORDERS & PAYMENTS ──────────────────────────────────────
+
+model Order {
+  id              String         @id @default(cuid())
+  orderNumber     String         @unique // human-readable: UV-20260922-A1B2
+  buyerId         String
+  buyer           User           @relation("BuyerOrders", fields: [buyerId], references: [id])
+  storefrontId    String
+  storefront      Storefront     @relation("SellerOrders", fields: [storefrontId], references: [id])
+  status          OrderStatus    @default(PENDING)
+  subtotal        Decimal        @db.Decimal(10, 2)
+  commission      Decimal        @default(0) @db.Decimal(10, 2)
+  total           Decimal        @db.Decimal(10, 2)
+  paymentMethod   PaymentMethod
+  deliveryMethod  DeliveryMethod
+  deliveryAddress Json?
+  buyerNote       String?
+  sellerNote      String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  items    OrderItem[]
+  payment  Payment?
+  dispute  Dispute?
+  messages Message[]
+
+  @@index([buyerId])
+  @@index([storefrontId])
+  @@index([status])
+  @@index([orderNumber])
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  COMPLETED
+  DISPUTED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  COD
+  DIGITAL
+  BANK_TRANSFER
+}
+
+enum DeliveryMethod {
+  DELIVERY
+  PICKUP
+  DIGITAL_DELIVERY
+}
+
+model OrderItem {
+  id        String  @id @default(cuid())
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  variantId String?
+  title     String  // snapshot at time of order
+  quantity  Int
+  unitPrice Decimal @db.Decimal(10, 2)
+  total     Decimal @db.Decimal(10, 2)
+
+  @@index([orderId])
+}
+
+model Payment {
+  id            String        @id @default(cuid())
+  orderId       String        @unique
+  order         Order         @relation(fields: [orderId], references: [id])
+  gatewayRef    String?       // external gateway transaction ID
+  method        PaymentMethod
+  amount        Decimal       @db.Decimal(10, 2)
+  status        PaymentStatus @default(PENDING)
+  capturedAt    DateTime?
+  releasedAt    DateTime?
+  refundedAt    DateTime?
+  autoReleaseAt DateTime?     // 7 days after delivery
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  ledgerEntries LedgerEntry[]
+
+  @@index([status])
+}
+
+enum PaymentStatus {
+  PENDING
+  CAPTURED
+  HELD
+  RELEASED
+  REFUNDED
+  FAILED
+}
+
+model LedgerEntry {
+  id        String     @id @default(cuid())
+  paymentId String
+  payment   Payment    @relation(fields: [paymentId], references: [id])
+  type      LedgerType
+  amount    Decimal    @db.Decimal(10, 2)
+  note      String?
+  createdAt DateTime   @default(now())
+
+  @@index([paymentId])
+}
+
+enum LedgerType {
+  CAPTURE
+  HOLD
+  RELEASE
+  COMMISSION_DEDUCT
+  REFUND
+  PAYOUT
+}
+
+model Dispute {
+  id             String        @id @default(cuid())
+  orderId        String        @unique
+  order          Order         @relation(fields: [orderId], references: [id])
+  reason         String
+  buyerEvidence  String?
+  sellerEvidence String?
+  status         DisputeStatus @default(OPEN)
+  resolution     String?
+  resolvedBy     String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+}
+
+enum DisputeStatus {
+  OPEN
+  SELLER_RESPONSE_PENDING
+  ADMIN_REVIEW
+  RESOLVED_BUYER
+  RESOLVED_SELLER
+  RESOLVED_SPLIT
+}
+
+// ─── MESSAGING & NOTIFICATIONS ──────────────────────────────
+
+model Message {
+  id         String   @id @default(cuid())
+  senderId   String
+  sender     User     @relation("Sender", fields: [senderId], references: [id])
+  receiverId String
+  receiver   User     @relation("Receiver", fields: [receiverId], references: [id])
+  orderId    String?
+  order      Order?   @relation(fields: [orderId], references: [id])
+  text       String
+  read       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([senderId, receiverId])
+  @@index([orderId])
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String
+  link      String?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  @@index([userId, read])
+}
+
+enum NotificationType {
+  ORDER_PLACED
+  ORDER_CONFIRMED
+  ORDER_SHIPPED
+  ORDER_DELIVERED
+  NEW_MESSAGE
+  NEW_FOLLOWER
+  NEW_REVIEW
+  LISTING_APPROVED
+  LISTING_FLAGGED
+  PAYOUT_SENT
+  DISPUTE_OPENED
+  DISPUTE_RESOLVED
+}
+
+// ─── SOCIAL & GROWTH ────────────────────────────────────────
+
+model Follow {
+  id           String     @id @default(cuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storefrontId String
+  storefront   Storefront @relation(fields: [storefrontId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
+  @@unique([userId, storefrontId])
+  @@index([storefrontId])
+}
+
+model Post {
+  id           String     @id @default(cuid())
+  storefrontId String
+  storefront   Storefront @relation(fields: [storefrontId], references: [id], onDelete: Cascade)
+  title        String
+  slug         String
+  content      String     // rich text / markdown
+  coverImage   String?
+  mediaUrls    String[]   @default([]) // for multi-image/video posts
+  postType     PostType   @default(UPDATE)
+  isPublished  Boolean    @default(false)
+  isPinned     Boolean    @default(false)
+  publishedAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@unique([storefrontId, slug])
+  @@index([storefrontId, isPublished])
+  @@index([storefrontId, isPinned])
+}
+
+enum PostType {
+  FOUNDING_STORY
+  UPDATE
+  MILESTONE
+  BEHIND_THE_SCENES
+  ANNOUNCEMENT
+}
+
+model Review {
+  id           String     @id @default(cuid())
+  authorId     String
+  author       User       @relation("ReviewAuthor", fields: [authorId], references: [id])
+  storefrontId String
+  storefront   Storefront @relation(fields: [storefrontId], references: [id])
+  productId    String
+  product      Product    @relation(fields: [productId], references: [id])
+  orderId      String     // must reference a completed order
+  rating       Int        // 1–5
+  comment      String
+  sellerReply  String?
+  repliedAt    DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@index([storefrontId])
+  @@index([productId])
+}
+
+// ─── ADMIN & MODERATION ─────────────────────────────────────
+
+model Report {
+  id         String       @id @default(cuid())
+  reporterId String
+  reporter   User         @relation("Reporter", fields: [reporterId], references: [id])
+  targetType ReportTarget
+  targetId   String
+  reason     ReportReason
+  details    String?
+  status     ReportStatus @default(OPEN)
+  resolvedBy String?
+  resolution String?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@index([status])
+  @@index([targetType, targetId])
+}
+
+enum ReportTarget {
+  LISTING
+  ACCOUNT
+  MESSAGE
+  REVIEW
+  POST
+}
+
+enum ReportReason {
+  SCAM
+  MISLEADING
+  OFFENSIVE
+  IP_VIOLATION
+  SPAM
+  OTHER
+}
+
+enum ReportStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  DISMISSED
+}
+
+model StaffMember {
+  id           String     @id @default(cuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storefrontId String
+  storefront   Storefront @relation(fields: [storefrontId], references: [id], onDelete: Cascade)
+  permissions  String[]   @default([]) // ["manage_orders", "respond_messages", "edit_listings"]
+  createdAt    DateTime   @default(now())
+
+  @@unique([userId, storefrontId])
+}

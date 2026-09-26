@@ -1,19 +1,29 @@
 const express = require('express');
 const router = express.Router();
-const { createProduct, getProducts } = require('../controllers/productController');
-const { protect } = require('../middleware/authMiddleware');
+const { createProduct, getProducts, getProduct, updateProduct } = require('../controllers/productController');
+const { protect, requireRole } = require('../middleware/authMiddleware');
+const { validate } = require('../middleware/validate');
+const { createProductSchema } = require('../lib/schemas');
 const { upload } = require('../config/cloudinary');
 
-router.route('/')
-  .get(getProducts)
-  .post(protect, (req, res, next) => {
+// Public routes
+router.get('/', getProducts);
+router.get('/:id', getProduct);
+
+// Protected vendor routes
+router.post(
+  '/',
+  protect,
+  requireRole('VENDOR', 'ADMIN'),
+  (req, res, next) => {
     upload.single('image')(req, res, (err) => {
-      if (err) {
-        console.log('MULTER ERROR:', err);
-        return res.status(400).json({ message: 'Upload failed', error: err.message });
-      }
+      if (err) return res.status(400).json({ message: 'Upload failed', error: err.message });
       next();
     });
-  }, createProduct);
+  },
+  createProduct
+);
+
+router.patch('/:id', protect, requireRole('VENDOR', 'ADMIN'), updateProduct);
 
 module.exports = router;
